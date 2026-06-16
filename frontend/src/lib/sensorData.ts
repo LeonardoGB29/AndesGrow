@@ -67,38 +67,32 @@ export type CropProfile = {
   maxHumedad: number;
 };
 
+// cultivos objetivo de AndesGrow (valles arequipeños). los ids y umbrales
+// coinciden con el modelo del backend (cultivos en backend/app/model.py).
 export const cropProfiles: CropProfile[] = [
   {
-    id: "arandanos",
-    nombre: "Arándanos",
-    emoji: "🫐",
-    descripcion: "Cultivo sensible al exceso y falta de agua.",
-    minHumedad: 27,
+    id: "palta",
+    nombre: "Palta (Hass)",
+    emoji: "🥑",
+    descripcion: "Muy sensible al riego: requiere humedad alta y constante.",
+    minHumedad: 35,
     maxHumedad: 70,
   },
   {
-    id: "papa",
-    nombre: "Papa",
-    emoji: "🥔",
-    descripcion: "Requiere humedad estable en zona radicular.",
-    minHumedad: 30,
-    maxHumedad: 75,
-  },
-  {
-    id: "maiz",
-    nombre: "Maíz",
-    emoji: "🌽",
-    descripcion: "Mayor demanda hídrica en crecimiento.",
+    id: "vid",
+    nombre: "Vid",
+    emoji: "🍇",
+    descripcion: "Tolera y se beneficia de cierto estrés hídrico controlado.",
     minHumedad: 25,
-    maxHumedad: 65,
+    maxHumedad: 60,
   },
   {
-    id: "cebolla",
-    nombre: "Cebolla",
-    emoji: "🧅",
-    descripcion: "Prefiere humedad moderada y controlada.",
-    minHumedad: 22,
-    maxHumedad: 60,
+    id: "citrico",
+    nombre: "Cítricos",
+    emoji: "🍊",
+    descripcion: "Demanda hídrica intermedia; presente en varios valles.",
+    minHumedad: 30,
+    maxHumedad: 65,
   },
 ];
 
@@ -225,15 +219,14 @@ function mapApiToSensores(data: AndesGrowApiResponse): Sensor[] {
   ];
 }
 
-async function fetchSensores(): Promise<Sensor[]> {
+async function fetchReading(): Promise<AndesGrowApiResponse> {
   const response = await fetch(`${API_BASE_URL}/sensores`);
 
   if (!response.ok) {
     throw new Error(`Error HTTP ${response.status}`);
   }
 
-  const data = (await response.json()) as AndesGrowApiResponse;
-  return mapApiToSensores(data);
+  return (await response.json()) as AndesGrowApiResponse;
 }
 
 const fallbackSensores: Sensor[] = [
@@ -273,18 +266,25 @@ const fallbackSensores: Sensor[] = [
   },
 ];
 
-export function useSensores(): Sensor[] {
+// hook principal: devuelve los sensores mapeados + la lectura cruda del backend
+// (que incluye la decisión del modelo: accion, minutos_faltantes, nivel_alerta...)
+export function useAndesGrow(): {
+  sensores: Sensor[];
+  reading: AndesGrowApiResponse | null;
+} {
   const [sensores, setSensores] = useState<Sensor[]>(fallbackSensores);
+  const [reading, setReading] = useState<AndesGrowApiResponse | null>(null);
 
   useEffect(() => {
     let activo = true;
 
     async function cargar() {
       try {
-        const data = await fetchSensores();
+        const data = await fetchReading();
 
         if (activo) {
-          setSensores(data);
+          setSensores(mapApiToSensores(data));
+          setReading(data);
         }
       } catch (error) {
         console.error("No se pudo leer la Raspberry:", error);
@@ -303,10 +303,43 @@ export function useSensores(): Sensor[] {
     };
   }, []);
 
-  return sensores;
+  return { sensores, reading };
 }
 
-export function getResumen(sensores: Sensor[]) {
+// atajo retrocompatible: solo los sensores
+export function useSensores(): Sensor[] {
+  return useAndesGrow().sensores;
+}
+
+// traduce el estado hídrico del modelo a la severidad que usa la UI
+function severidadDesdeEstado(estado: string): Severidad {
+  if (estado === "critico") return "critico";
+  if (estado === "bajo") return "bajo";
+  if (estado === "vigilancia") return "atencion";
+  return "ok";
+}
+
+export type Resumen = {
+  total: number;
+  secos: number;
+  humedos: number;
+  pctSeco: number;
+  tempProm: number;
+  zonasCriticas: string[];
+  urgencia: Severidad;
+  necesitaRiego: boolean;
+  mensajeEstado: string;
+  // salida del modelo (null cuando no hay backend y se usa el cálculo local)
+  minutosRiego: number | null;
+  mensajeModelo: string | null;
+  fechaEstimada: string | null;
+  fuente: "modelo" | "local";
+};
+
+export function getResumen(
+  sensores: Sensor[],
+  reading?: AndesGrowApiResponse | null,
+): Resumen {
   const total = sensores.length;
 
   const secos = sensores.filter(
@@ -314,7 +347,6 @@ export function getResumen(sensores: Sensor[]) {
   ).length;
 
   const humedos = total - secos;
-
   const pctSeco = total === 0 ? 0 : Math.round((secos / total) * 100);
 
   const tempProm =
@@ -330,8 +362,35 @@ export function getResumen(sensores: Sensor[]) {
     .filter((s) => s.severidad === "critico" || s.severidad === "bajo")
     .map((s) => s.nombre);
 
-  let urgencia: Severidad = "ok";
+  // --- decisión del modelo (backend) ---
+  if (reading) {
+    const urgencia = severidadDesdeEstado(reading.estado_hidrico);
+    const necesitaRiego = reading.accion === "regar";
+    const mensajeEstado = necesitaRiego
+      ? "Riego recomendado"
+      : urgencia === "atencion"
+        ? "Humedad en vigilancia"
+        : "Humedad estable";
 
+    return {
+      total,
+      secos,
+      humedos,
+      pctSeco,
+      tempProm,
+      zonasCriticas,
+      urgencia,
+      necesitaRiego,
+      mensajeEstado,
+      minutosRiego: reading.minutos_faltantes,
+      mensajeModelo: reading.alerta,
+      fechaEstimada: reading.fecha_estimada,
+      fuente: "modelo",
+    };
+  }
+
+  // --- fallback local (sin backend) ---
+  let urgencia: Severidad = "ok";
   if (sensores.some((s) => s.severidad === "critico")) {
     urgencia = "critico";
   } else if (sensores.some((s) => s.severidad === "bajo")) {
@@ -341,7 +400,6 @@ export function getResumen(sensores: Sensor[]) {
   }
 
   const necesitaRiego = urgencia === "critico" || urgencia === "bajo";
-
   const mensajeEstado = necesitaRiego
     ? "Riego recomendado"
     : urgencia === "atencion"
@@ -358,6 +416,10 @@ export function getResumen(sensores: Sensor[]) {
     urgencia,
     necesitaRiego,
     mensajeEstado,
+    minutosRiego: null,
+    mensajeModelo: null,
+    fechaEstimada: null,
+    fuente: "local",
   };
 }
 

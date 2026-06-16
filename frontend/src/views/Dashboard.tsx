@@ -11,7 +11,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import {
-  useSensores,
+  useAndesGrow,
   getResumen,
   severidadStyle,
   type Sensor,
@@ -21,8 +21,8 @@ import HumidityChart from "@/components/HumidityChart";
 import ParcelMap from "@/components/ParcelMap";
 
 export default function Dashboard() {
-  const sensores = useSensores();
-  const resumen = getResumen(sensores);
+  const { sensores, reading } = useAndesGrow();
+  const resumen = getResumen(sensores, reading);
   const [selected, setSelected] = useState<string | null>(null);
 
   const heroColor =
@@ -69,12 +69,17 @@ export default function Dashboard() {
 
         <p className="text-sm opacity-90 mb-1">Acción recomendada</p>
         <h2 className="text-3xl font-extrabold leading-tight mb-2">
-          {resumen.necesitaRiego ? "Iniciar riego" : "No regar"}
+          {resumen.necesitaRiego
+            ? resumen.minutosRiego != null
+              ? `Regar ${resumen.minutosRiego} min`
+              : "Iniciar riego"
+            : "No regar"}
         </h2>
         <p className="text-sm opacity-95 mb-4">
-          {resumen.necesitaRiego
-            ? `${resumen.secos} de ${resumen.total} zonas requieren riego (${resumen.pctSeco}% de la parcela).`
-            : "Todas las zonas presentan humedad adecuada."}
+          {resumen.mensajeModelo ??
+            (resumen.necesitaRiego
+              ? `${resumen.secos} de ${resumen.total} zonas requieren riego (${resumen.pctSeco}% de la parcela).`
+              : "Todas las zonas presentan humedad adecuada.")}
         </p>
 
         {resumen.necesitaRiego && resumen.zonasCriticas.length > 0 && (
@@ -94,8 +99,19 @@ export default function Dashboard() {
           className="w-full bg-white text-gray-900 font-bold py-3 rounded-2xl flex items-center justify-center gap-2 active:scale-[0.98] transition shadow-lg"
         >
           <Play size={18} fill="currentColor" />
-          {resumen.necesitaRiego ? "Activar riego ahora" : "Sin acción"}
+          {resumen.necesitaRiego
+            ? resumen.minutosRiego != null
+              ? `Activar riego (${resumen.minutosRiego} min)`
+              : "Activar riego ahora"
+            : "Sin acción"}
         </button>
+
+        <p className="text-[10px] opacity-80 mt-3 flex items-center gap-1">
+          <Sparkles size={10} />
+          {resumen.fuente === "modelo"
+            ? "Decisión calculada por el modelo (Random Forest)"
+            : "Sin conexión al backend · estimación local"}
+        </p>
       </section>
 
       {/* Resumen ejecutivo en texto descriptivo */}

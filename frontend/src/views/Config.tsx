@@ -102,7 +102,7 @@ export default function Config() {
         <p className="text-xs text-gray-500 mb-3">
           El sistema usará rangos recomendados según el cultivo seleccionado.
         </p>
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-3 gap-2">
           {cropProfiles.map((p) => {
             const active = selected.id === p.id;
             return (
