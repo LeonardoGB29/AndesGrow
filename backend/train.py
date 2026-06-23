@@ -9,7 +9,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
 from app.clima import cargar as cargar_clima
-from app.model import cultivos, entrenar, generar_datos, importancia, predecir_riego
+from app.model import entrenar, generar_datos, importancia
 
 # 0) clima real (ET0 fao-56 + temperatura) de un valle de arequipa
 clima = cargar_clima()
@@ -33,8 +33,4 @@ print("importancia de variables:")
 for k, v in importancia().items():
     print(f"  {k:14s} {v}")
 
-# 5) ejemplos: mismo suelo seco a mediodia, distinto cultivo
-print("\nejemplos (humedad 22%, tension 60 cbar, 28°c, 13h):")
-for c in cultivos:
-    r = predecir_riego(c, 22, 60, 28, 13)
-    print(f"  {c:8s} -> {r['minutos_riego']:2d} min | {r['mensaje']}")
+# Las inferencias se prueban con ventanas completas mediante predict_dataset.py.

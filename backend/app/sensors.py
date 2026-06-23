@@ -15,11 +15,13 @@ from dataclasses import dataclass
 @dataclass
 class LecturaSensores:
     temperatura_c: float
+    temperatura_suelo_c: float
     humedad_20cm_pct: float
     humedad_20cm_digital: int
     humedad_40cm_pct: float
     humedad_40cm_digital: int | None
     swt_20cm_cbar: float
+    swt_40cm_cbar: float
     presion_raw: float
     sensor_presion_ok: bool
 
@@ -45,11 +47,13 @@ def leer_sensores(hora_dia: int) -> LecturaSensores:
     humedad_40 = round(52 - 10 * s, 1)
     return LecturaSensores(
         temperatura_c=round(14 + 12 * s, 1),
+        temperatura_suelo_c=round(15 + 9 * s, 1),
         humedad_20cm_pct=humedad_20,
         humedad_20cm_digital=0 if humedad_20 >= 27 else 1,
         humedad_40cm_pct=humedad_40,
         humedad_40cm_digital=0 if humedad_40 >= 27 else 1,
         swt_20cm_cbar=round(10 + 50 * s, 1),
+        swt_40cm_cbar=round(8 + 35 * s, 1),
         presion_raw=512.0,
         sensor_presion_ok=True,
     )

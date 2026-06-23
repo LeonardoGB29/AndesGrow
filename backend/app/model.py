@@ -1,152 +1,135 @@
-"""modelo de riego: random forest regressor.
-
-convierte el estado del suelo + el cultivo en minutos de riego.
-los datos de entrenamiento se generan con balance hidrico fao-56 alimentado
-con ET0 y temperatura reales de arequipa (ver clima.py). asi el modelo aprende
-de fisica agronomica real, no de una formula inventada.
-"""
-
+"""Modelo temporal de riego: cada inferencia usa una hora de historial."""
 from __future__ import annotations
-
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-
 import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-
 from .clima import cargar as cargar_clima
 
-# cultivos soportados (parametros fao-56):
-#   umbral = humedad objetivo (%), la meta de cada cultivo
-#   kc     = coeficiente de cultivo (cuanta agua demanda vs la referencia)
-#   zr     = profundidad de raiz (m) -> cuanta agua cabe en la zona radicular
-# palta: sensible, riega seguido (umbral alto), raiz superficial
-# vid: tolera estres (umbral bajo), raiz profunda
-# citrico: intermedio
 cultivos = {
-    "palta":   {"nombre": "palta",   "emoji": "🥑", "id": 0, "umbral": 35, "kc": 0.90, "zr": 0.5},
-    "vid":     {"nombre": "vid",     "emoji": "🍇", "id": 1, "umbral": 25, "kc": 0.70, "zr": 1.0},
-    "citrico": {"nombre": "cítrico", "emoji": "🍊", "id": 2, "umbral": 30, "kc": 0.65, "zr": 0.9},
+    "palta": {"nombre": "palta", "id": 0, "umbral": 35, "kc": .90, "zr": .5},
+    "vid": {"nombre": "vid", "id": 1, "umbral": 25, "kc": .70, "zr": 1.0},
+    "citrico": {"nombre": "citrico", "id": 2, "umbral": 30, "kc": .65, "zr": .9},
 }
-
-# variables que entran al modelo
-features = ["humedad_pct", "tension_cbar", "temperatura_c", "hora_dia", "cultivo_id"]
-
-# parametros del riego por goteo
-TASA_GOTEO = 10.0   # mm/h que aplica el sistema
-EF_RIEGO = 0.9      # eficiencia del goteo (parte que aprovecha la planta)
-AGUA_DISP = 0.13    # agua disponible del suelo (m3/m3), suelo franco tipico
-
-ruta_modelo = Path(os.getenv("ANDESGROW_MODEL_PATH", "models/riego_rf.pkl"))
-
+SENSORES = ("VWC_20cm_%", "VWC_40cm_%", "T_soil_C", "SWT_20cm_cBar",
+            "SWT_40cm_cBar", "temperatura_ambiente")
+HISTORIAL_MINUTOS, MIN_LECTURAS, INTERVALO_PREDICCION_MINUTOS = 60, 10, 15
+features = [
+    *(f"{s}_actual" for s in SENSORES), *(f"{s}_media" for s in SENSORES),
+    *(f"{s}_std" for s in SENSORES), *(f"{s}_tendencia_h" for s in SENSORES),
+    "hora_dia", "cultivo_id", "duracion_historial_min", "numero_lecturas",
+]
+TASA_GOTEO, EF_RIEGO, AGUA_DISP = 10., .9, .13
+ruta_modelo = Path(os.getenv("ANDESGROW_MODEL_PATH", "models/riego_temporal_rf.pkl"))
 _modelo = None
 
+def _fecha(v):
+    return v if isinstance(v, datetime) else datetime.fromisoformat(str(v))
 
-def _taw(zr: float) -> float:
-    # agua total disponible en la zona radicular (mm)
-    return 1000 * AGUA_DISP * zr
+def _tension(h):
+    return 100 * (1 - h / 100) ** 2
 
+def _minutos(humedad, hora, et0, temp, cultivo):
+    deficit = max(0., (cultivo["umbral"] - humedad) / 100 *
+                  (1000 * AGUA_DISP * cultivo["zr"]))
+    if not deficit:
+        return 0.
+    fraccion = 1. if hora <= 6 else .1 if hora >= 18 else (18 - hora) / 12
+    etc = et0 * cultivo["kc"] * (1 + (temp - 18) / 50)
+    return (deficit + etc * fraccion) / EF_RIEGO / TASA_GOTEO * 60
 
-def _tension(humedad: float) -> float:
-    # curva de retencion simple: la tension sube cuando baja la humedad
-    return round(100 * (1 - humedad / 100) ** 2, 1)
+def preparar_historial(historial, cultivo):
+    """Resume nivel, promedio, variabilidad y tendencia de la ultima hora."""
+    if len(historial) < MIN_LECTURAS:
+        raise ValueError(f"se requieren al menos {MIN_LECTURAS} lecturas")
+    filas = sorted(historial, key=lambda f: _fecha(f["timestamp"]))
+    fin = _fecha(filas[-1]["timestamp"])
+    filas = [f for f in filas if _fecha(f["timestamp"]) >=
+             fin - timedelta(minutes=HISTORIAL_MINUTOS)]
+    inicio = _fecha(filas[0]["timestamp"])
+    t = np.array([(_fecha(f["timestamp"]) - inicio).total_seconds() / 60 for f in filas])
+    if len(filas) < MIN_LECTURAS or float(t[-1]) < 48:
+        raise ValueError("el historial debe tener 10 lecturas y cubrir al menos 48 minutos")
+    actual, media, std, tendencia = [], [], [], []
+    for sensor in SENSORES:
+        v = np.array([float(f[sensor]) for f in filas])
+        actual.append(float(v[-1])); media.append(float(v.mean()))
+        std.append(float(v.std())); tendencia.append(float(np.polyfit(t, v, 1)[0] * 60))
+    info = cultivos.get(cultivo, cultivos["palta"])
+    x = np.array([*actual, *media, *std, *tendencia,
+                  fin.hour + fin.minute / 60, info["id"], float(t[-1]), len(filas)])
+    return x, {"inicio": inicio, "fin": fin, "lecturas": len(filas),
+               "humedad": actual[0], "tendencia": tendencia[0]}
 
-
-def _frac_dia(hora: int) -> float:
-    # fraccion del dia (y de la evaporacion) que aun queda por delante
-    if hora <= 6:
-        return 1.0
-    if hora >= 18:
-        return 0.1
-    return (18 - hora) / 12
-
-
-def _minutos_fao56(moist, hora, et0, temp, cult) -> float:
-    # cuanto regar segun fao-56: reponer el deficit + cubrir la evaporacion del dia
-    deficit = max(0.0, (cult["umbral"] - moist) / 100 * _taw(cult["zr"]))  # mm a reponer
-    if deficit <= 0:
-        return 0.0
-    # demanda del cultivo: ET0 real ajustada por el calor del momento y la hora
-    etc = et0 * cult["kc"] * (1 + (temp - 18) / 50)  # mm/dia
-    lamina = deficit + etc * _frac_dia(hora)         # mm netos a aplicar
-    bruta = lamina / EF_RIEGO                         # mm reales (descontando ineficiencia)
-    return bruta / TASA_GOTEO * 60                    # minutos de riego
-
-
-def generar_datos(n: int = 4000):
-    # genera n situaciones (suelo + dia real de arequipa) con sus minutos fao-56
-    rng = np.random.default_rng(42)
-    clima = cargar_clima()
-    nombres = list(cultivos)
-    X, y = [], []
-    for _ in range(n):
-        cult = cultivos[nombres[rng.integers(len(nombres))]]
-        dia = clima[rng.integers(len(clima))]                   # un dia real
-        moist = rng.uniform(10, 70)                             # estado real del suelo (latente)
-        hora = int(rng.integers(0, 24))
-        temp = dia["temp"] + rng.normal(0, 2)
-        # dos sensores que miden el mismo suelo con ruido independiente
-        humedad = float(np.clip(moist + rng.normal(0, 4), 5, 80))
-        tension = float(np.clip(_tension(moist) + rng.normal(0, 8), 0, 95))
-        minutos = _minutos_fao56(moist, hora, dia["et0"], temp, cult)
-        minutos = max(0.0, minutos + rng.normal(0, 1.0))        # ruido de medicion
-        X.append([humedad, tension, temp, hora, cult["id"]])
-        y.append(minutos)
+def generar_datos(n=4000):
+    """Genera secuencias; el objetivo considera la humedad dentro de una hora."""
+    rng, clima = np.random.default_rng(42), cargar_clima()
+    X, y, base = [], [], datetime(2025, 1, 1)
+    for i in range(n):
+        nombre = list(cultivos)[rng.integers(3)]
+        cultivo, dia = cultivos[nombre], clima[rng.integers(len(clima))]
+        hora, humedad = int(rng.integers(24)), rng.uniform(10, 70)
+        dh, temp, dt = rng.uniform(-4, 2), dia["temp"] + rng.normal(0, 2), rng.uniform(-1.5, 1.5)
+        fin, historial = base + timedelta(days=i % 365, hours=hora), []
+        for atras in range(60, -1, -5):
+            f, h = -atras / 60, humedad + dh * (-atras / 60)
+            ta = temp + dt * f + rng.normal(0, .25)
+            historial.append({
+                "timestamp": fin - timedelta(minutes=atras),
+                "VWC_20cm_%": np.clip(h + rng.normal(0, .7), 5, 80),
+                "VWC_40cm_%": np.clip(h + 5 + dh * .35 * f + rng.normal(0, .5), 5, 80),
+                "T_soil_C": ta - 1.5 + rng.normal(0, .2),
+                "SWT_20cm_cBar": np.clip(_tension(h) + rng.normal(0, 1.5), 0, 95),
+                "SWT_40cm_cBar": np.clip(_tension(h + 5) + rng.normal(0, 1), 0, 95),
+                "temperatura_ambiente": ta,
+            })
+        X.append(preparar_historial(historial, nombre)[0])
+        futura = np.clip(humedad + dh, 5, 80)
+        y.append(max(0., _minutos(futura, hora, dia["et0"], temp, cultivo) + rng.normal(0, .7)))
     return np.array(X), np.array(y)
 
-
-def entrenar(X=None, y=None) -> RandomForestRegressor:
-    # entrena el random forest y lo guarda en disco
-    if X is None or y is None:
-        X, y = generar_datos()
-    rf = RandomForestRegressor(n_estimators=200, random_state=42)
-    rf.fit(X, y)
+def entrenar(X=None, y=None):
+    X, y = generar_datos() if X is None or y is None else (X, y)
+    modelo = RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
+    modelo.fit(X, y)
     ruta_modelo.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(rf, ruta_modelo)
-    return rf
+    joblib.dump(modelo, ruta_modelo)
+    return modelo
 
-
-def get_modelo() -> RandomForestRegressor:
-    # carga el modelo del disco, o lo entrena la primera vez
+def get_modelo():
     global _modelo
     if _modelo is None:
-        _modelo = joblib.load(ruta_modelo) if ruta_modelo.exists() else entrenar()
+        if ruta_modelo.exists():
+            candidato = joblib.load(ruta_modelo)
+            _modelo = candidato if candidato.n_features_in_ == len(features) else entrenar()
+        else:
+            _modelo = entrenar()
     return _modelo
 
+def importancia():
+    return {f: round(float(p), 3) for f, p in zip(features, get_modelo().feature_importances_)}
 
-def importancia() -> dict:
-    # peso de cada variable en la decision: que sensor pesa mas
-    m = get_modelo()
-    return {f: round(float(p), 3) for f, p in zip(features, m.feature_importances_)}
-
-
-def predecir_riego(cultivo, humedad_pct, tension_cbar, temperatura_c, hora_dia) -> dict:
-    # predice los minutos de riego para el estado actual del cultivo
-    info = cultivos.get(cultivo, cultivos["palta"])
-    m = get_modelo()
-    x = [[humedad_pct, tension_cbar, temperatura_c, hora_dia, info["id"]]]
-    pred = float(m.predict(x)[0])
-    # menos de 2 min es ruido del modelo: se considera "no regar"
+def predecir_riego(cultivo, historial):
+    """Predice con una ventana temporal, nunca con un registro aislado."""
+    x, contexto = preparar_historial(historial, cultivo)
+    modelo, matriz = get_modelo(), x.reshape(1, -1)
+    pred = float(modelo.predict(matriz)[0])
     minutos = int(round(pred)) if pred >= 2 else 0
-
-    # confianza: que tanto coinciden los arboles entre si
-    preds = np.array([arbol.predict(x)[0] for arbol in m.estimators_])
-    confianza = round(float(max(0.0, 1 - preds.std() / (preds.mean() + 1e-6))), 2)
-
-    umbral = info["umbral"]
-    if minutos == 0:
-        mensaje = f"no regar (humedad {humedad_pct:.0f}% ≥ meta {umbral}%)"
-        momento = None
-    else:
-        mensaje = f"regar {minutos} min para llegar al {umbral}% de humedad"
-        momento = datetime.now().isoformat(timespec="minutes")
-
+    arboles = np.array([a.predict(matriz)[0] for a in modelo.estimators_])
+    confianza = round(float(np.clip(1 - arboles.std() / max(abs(arboles.mean()), 2), 0, 1)), 2)
+    tendencia = contexto["tendencia"]
+    mensaje = (f"regar {minutos} min" if minutos else "no regar")
+    mensaje += f"; humedad cambia {tendencia:+.2f}%/h en la ultima hora"
+    info = cultivos.get(cultivo, cultivos["palta"])
     return {
         "minutos_riego": minutos,
-        "momento_optimo": momento,
-        "umbral_objetivo_pct": float(umbral),
-        "mensaje": mensaje,
-        "confianza": confianza if minutos > 0 else None,
+        "momento_optimo": contexto["fin"].isoformat(timespec="minutes") if minutos else None,
+        "umbral_objetivo_pct": float(info["umbral"]), "mensaje": mensaje,
+        "confianza": confianza if minutos else None,
+        "ventana_inicio": contexto["inicio"].isoformat(timespec="minutes"),
+        "ventana_fin": contexto["fin"].isoformat(timespec="minutes"),
+        "lecturas_ventana": contexto["lecturas"],
+        "tendencia_humedad_pct_h": round(tendencia, 3),
     }

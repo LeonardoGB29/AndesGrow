@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 TipoCultivo = Literal["palta", "vid", "citrico"]
 
@@ -52,13 +52,19 @@ class SensoresResponse(BaseModel):
 
 
 class RecomendacionRequest(BaseModel):
-    """Inputs del Random Forest. Si no se envían, el backend toma la última
-    lectura de los sensores y completa los faltantes."""
+    """Una fila de dataset_suelo.csv para inferencia."""
+
+    model_config = ConfigDict(populate_by_name=True)
 
     cultivo: TipoCultivo = "palta"
-    humedad_pct: Optional[float] = None
-    tension_cbar: Optional[float] = None
-    temperatura_c: Optional[float] = None
+    id_kit: Optional[str] = None
+    timestamp: Optional[str] = None
+    vwc_20cm_pct: Optional[float] = Field(default=None, alias="VWC_20cm_%")
+    vwc_40cm_pct: Optional[float] = Field(default=None, alias="VWC_40cm_%")
+    t_soil_c: Optional[float] = Field(default=None, alias="T_soil_C")
+    swt_20cm_cbar: Optional[float] = Field(default=None, alias="SWT_20cm_cBar")
+    swt_40cm_cbar: Optional[float] = Field(default=None, alias="SWT_40cm_cBar")
+    temperatura_ambiente: Optional[float] = None
     hora_dia: Optional[int] = Field(default=None, ge=0, le=23)
 
 

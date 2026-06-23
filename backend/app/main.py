@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +37,28 @@ app.add_middleware(
 # cultivo configurado para la parcela (luego vendra de la config de usuario)
 CULTIVO_PARCELA = os.getenv("ANDESGROW_CULTIVO", "palta")
 SIMULADO = os.getenv("ANDESGROW_FAKE_SENSORS", "1") == "1"
+_HISTORIALES = defaultdict(deque)
+
+
+def _recomendar(cultivo, kit, timestamp, valores):
+    """Acumula lecturas por kit y solo consulta el modelo con una hora de historia."""
+    ahora = datetime.fromisoformat(timestamp)
+    historial = _HISTORIALES[kit]
+    historial.append({"timestamp": timestamp, **valores})
+    while historial and (
+        ahora - datetime.fromisoformat(historial[0]["timestamp"])
+    ) > timedelta(minutes=60):
+        historial.popleft()
+    try:
+        return predecir_riego(cultivo, list(historial))
+    except ValueError as error:
+        return {
+            "minutos_riego": 0,
+            "momento_optimo": None,
+            "umbral_objetivo_pct": float(cultivos[cultivo]["umbral"]),
+            "mensaje": f"recopilando historial temporal: {error}",
+            "confianza": None,
+        }
 
 
 def _estado_riego(humedad_pct: float, umbral: float, minutos: int):
@@ -66,12 +89,16 @@ def sensores():
     lectura = leer_sensores(ahora.hour)
 
     # el modelo decide a partir de la humedad superficial y la tension
-    rec = predecir_riego(
-        cultivo=CULTIVO_PARCELA,
-        humedad_pct=lectura.humedad_20cm_pct,
-        tension_cbar=lectura.swt_20cm_cbar,
-        temperatura_c=lectura.temperatura_c,
-        hora_dia=ahora.hour,
+    rec = _recomendar(
+        CULTIVO_PARCELA, "KIT_001", ahora.isoformat(timespec="seconds"),
+        {
+            "VWC_20cm_%": lectura.humedad_20cm_pct,
+            "VWC_40cm_%": lectura.humedad_40cm_pct,
+            "T_soil_C": lectura.temperatura_suelo_c,
+            "SWT_20cm_cBar": lectura.swt_20cm_cbar,
+            "SWT_40cm_cBar": lectura.swt_40cm_cbar,
+            "temperatura_ambiente": lectura.temperatura_c,
+        },
     )
     minutos = rec["minutos_riego"]
     estado, nivel, accion = _estado_riego(
@@ -112,25 +139,37 @@ def recomendacion(req: RecomendacionRequest):
     lectura = leer_sensores(ahora.hour)
 
     # usa lo que mande el cliente; lo que falte, lo toma de los sensores
-    humedad = req.humedad_pct if req.humedad_pct is not None else lectura.humedad_20cm_pct
-    tension = req.tension_cbar if req.tension_cbar is not None else lectura.swt_20cm_cbar
-    temperatura = req.temperatura_c if req.temperatura_c is not None else lectura.temperatura_c
-    hora = req.hora_dia if req.hora_dia is not None else ahora.hour
+    humedad_20 = req.vwc_20cm_pct if req.vwc_20cm_pct is not None else lectura.humedad_20cm_pct
+    humedad_40 = req.vwc_40cm_pct if req.vwc_40cm_pct is not None else lectura.humedad_40cm_pct
+    temp_suelo = req.t_soil_c if req.t_soil_c is not None else lectura.temperatura_suelo_c
+    tension_20 = req.swt_20cm_cbar if req.swt_20cm_cbar is not None else lectura.swt_20cm_cbar
+    tension_40 = req.swt_40cm_cbar if req.swt_40cm_cbar is not None else lectura.swt_40cm_cbar
+    temperatura = req.temperatura_ambiente if req.temperatura_ambiente is not None else lectura.temperatura_c
+    if req.hora_dia is not None:
+        hora = req.hora_dia
+    elif req.timestamp:
+        hora = datetime.fromisoformat(req.timestamp).hour
+    else:
+        hora = ahora.hour
 
-    rec = predecir_riego(
-        cultivo=req.cultivo,
-        humedad_pct=humedad,
-        tension_cbar=tension,
-        temperatura_c=temperatura,
-        hora_dia=hora,
+    timestamp = req.timestamp or ahora.isoformat(timespec="seconds")
+    rec = _recomendar(
+        req.cultivo, req.id_kit or "KIT_API", timestamp,
+        {
+            "VWC_20cm_%": humedad_20,
+            "VWC_40cm_%": humedad_40,
+            "T_soil_C": temp_suelo,
+            "SWT_20cm_cBar": tension_20,
+            "SWT_40cm_cBar": tension_40,
+            "temperatura_ambiente": temperatura,
+        },
     )
-
     return RecomendacionResponse(
         cultivo=req.cultivo,
         minutos_riego=rec["minutos_riego"],
         momento_optimo=rec["momento_optimo"],
-        humedad_actual_pct=humedad,
-        tension_cbar=tension,
+        humedad_actual_pct=humedad_20,
+        tension_cbar=tension_20,
         umbral_objetivo_pct=rec["umbral_objetivo_pct"],
         mensaje=rec["mensaje"],
         confianza=rec["confianza"],

@@ -47,7 +47,23 @@ python train.py
 El `.pkl` se guarda en `models/` y `model.py` lo carga solo (si no existe, se
 entrena en el primer arranque). El clima se cachea en `data/clima_arequipa.json`.
 
-Features del modelo: `[humedad_pct, tension_cbar, temperatura_c, hora_dia, cultivo_id]`
+Features del modelo: `[VWC_20cm_%, VWC_40cm_%, T_soil_C, SWT_20cm_cBar, SWT_40cm_cBar, temperatura_ambiente, hora_dia, cultivo_id]`.
+`hora_dia` se extrae de `timestamp` y `cultivo_id` viene de la configuración; `id_kit` identifica el dispositivo pero no entra al Random Forest.
+
+### Ejecutar el modelo sobre el dataset
+
+El dataset se encuentra en `data/dataset_suelo.csv`. Desde la carpeta
+`backend`, ejecuta:
+
+```bash
+python predict_dataset.py --cultivo palta
+```
+
+El resultado se guarda en `data/predicciones_riego.csv`. Para una prueba rápida:
+
+```bash
+python predict_dataset.py --cultivo palta --limite 10
+```
 → target `minutos_riego`. Cultivos y sus parámetros FAO-56 (Kc, raíz, umbral) en `model.py`.
 
 ## Estructura
